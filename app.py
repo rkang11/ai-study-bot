@@ -1,5 +1,9 @@
 import math
 import os
+import json
+import html
+import re
+import textwrap
 
 import fitz  # PyMuPDF
 import streamlit as st
@@ -722,6 +726,406 @@ def show_study_notes(
     with st.expander("View full study notes"):
         st.markdown(study_notes)
 
+    st.download_button(
+        "Download study notes PDF",
+        data=create_study_notes_pdf(study_notes),
+        file_name="study-notes.pdf",
+        mime="application/pdf",
+    )
+
+
+def strip_markdown(text):
+    clean_text = text.replace("**", "")
+    clean_text = clean_text.replace("__", "")
+    clean_text = clean_text.replace("`", "")
+    clean_text = re.sub(r"^#{1,6}\s*", "", clean_text, flags=re.MULTILINE)
+    clean_text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", clean_text)
+    return clean_text
+
+
+def add_pdf_page(document):
+    return document.new_page(width=612, height=792)
+
+
+def draw_wrapped_text(page, text, x, y, width, font_size=11, line_gap=4):
+    max_chars = max(20, int(width / (font_size * 0.52)))
+    lines = []
+
+    for raw_line in str(text).splitlines():
+        if not raw_line.strip():
+            lines.append("")
+            continue
+
+        lines.extend(
+            textwrap.wrap(
+                raw_line,
+                width=max_chars,
+                replace_whitespace=False,
+            )
+        )
+
+    line_height = font_size + line_gap
+
+    for line in lines:
+        if line:
+            page.insert_text(
+                (x, y),
+                line,
+                fontsize=font_size,
+                fontname="helv",
+                color=(0.1, 0.1, 0.1),
+            )
+        y += line_height
+
+    return y
+
+
+def parse_bold_segments(text):
+    segments = []
+    current_index = 0
+
+    for match in re.finditer(r"\*\*(.+?)\*\*", text):
+        if match.start() > current_index:
+            segments.append((text[current_index:match.start()], False))
+
+        segments.append((match.group(1), True))
+        current_index = match.end()
+
+    if current_index < len(text):
+        segments.append((text[current_index:], False))
+
+    return segments or [(text, False)]
+
+
+def draw_rich_text_line(
+    page,
+    segments,
+    x,
+    y,
+    width,
+    font_size=11,
+    line_gap=4,
+):
+    cursor_x = x
+    max_x = x + width
+    line_height = font_size + line_gap
+
+    for text, is_bold in segments:
+        font_name = "hebo" if is_bold else "helv"
+        tokens = re.findall(r"\S+\s*", text)
+
+        for token in tokens:
+            token_width = fitz.get_text_length(
+                token,
+                fontname=font_name,
+                fontsize=font_size,
+            )
+
+            if cursor_x > x and cursor_x + token_width > max_x:
+                cursor_x = x
+                y += line_height
+
+            page.insert_text(
+                (cursor_x, y),
+                token,
+                fontsize=font_size,
+                fontname=font_name,
+                color=(0.1, 0.1, 0.1),
+            )
+            cursor_x += token_width
+
+    return y + line_height
+
+
+def ensure_pdf_space(document, page, y, needed_space):
+    if y + needed_space <= 740:
+        return page, y
+
+    return add_pdf_page(document), 60
+
+
+def create_text_pdf(title, body):
+    document = fitz.open()
+    page = add_pdf_page(document)
+    margin = 54
+    y = 60
+
+    page.insert_text(
+        (margin, y),
+        title,
+        fontsize=20,
+        fontname="helv",
+        color=(0.05, 0.05, 0.05),
+    )
+    y += 36
+
+    for paragraph in strip_markdown(body).split("\n\n"):
+        if y > 720:
+            page = add_pdf_page(document)
+            y = 60
+
+        y = draw_wrapped_text(page, paragraph, margin, y, 504)
+        y += 12
+
+    pdf_bytes = document.tobytes()
+    document.close()
+    return pdf_bytes
+
+
+def create_study_notes_pdf(study_notes):
+    document = fitz.open()
+    page = add_pdf_page(document)
+    margin = 54
+    y = 60
+
+    page.insert_text(
+        (margin, y),
+        "Study Notes",
+        fontsize=22,
+        fontname="hebo",
+        color=(0.05, 0.05, 0.05),
+    )
+    y += 38
+
+    for raw_line in study_notes.splitlines():
+        line = raw_line.rstrip()
+
+        if not line.strip():
+            y += 10
+            continue
+
+        heading_match = re.match(r"^(#{1,6})\s+(.*)$", line)
+
+        if heading_match:
+            level = len(heading_match.group(1))
+            heading_text = heading_match.group(2)
+            font_size = 17 if level <= 2 else 14
+            y += 8 if level <= 2 else 4
+            page, y = ensure_pdf_space(document, page, y, 34)
+            y = draw_rich_text_line(
+                page,
+                [(heading_text, True)],
+                margin,
+                y,
+                504,
+                font_size=font_size,
+                line_gap=6,
+            )
+            y += 4
+            continue
+
+        bullet_match = re.match(r"^(\s*)[-*]\s+(.*)$", line)
+        numbered_match = re.match(r"^(\s*)(\d+\.)\s+(.*)$", line)
+
+        if bullet_match:
+            indent = min(len(bullet_match.group(1)) * 4, 36)
+            content = bullet_match.group(2)
+            page, y = ensure_pdf_space(document, page, y, 30)
+            page.insert_text(
+                (margin + indent, y),
+                "-",
+                fontsize=11,
+                fontname="helv",
+            )
+            y = draw_rich_text_line(
+                page,
+                parse_bold_segments(content),
+                margin + indent + 18,
+                y,
+                486 - indent,
+            )
+            continue
+
+        if numbered_match:
+            indent = min(len(numbered_match.group(1)) * 4, 36)
+            label = numbered_match.group(2)
+            content = numbered_match.group(3)
+            page, y = ensure_pdf_space(document, page, y, 30)
+            page.insert_text(
+                (margin + indent, y),
+                label,
+                fontsize=11,
+                fontname="helv",
+            )
+            y = draw_rich_text_line(
+                page,
+                parse_bold_segments(content),
+                margin + indent + 26,
+                y,
+                478 - indent,
+            )
+            continue
+
+        page, y = ensure_pdf_space(document, page, y, 30)
+        y = draw_rich_text_line(
+            page,
+            parse_bold_segments(line),
+            margin,
+            y,
+            504,
+        )
+
+    pdf_bytes = document.tobytes()
+    document.close()
+    return pdf_bytes
+
+
+def get_quiz_questions(quiz_data):
+    if isinstance(quiz_data, dict):
+        return quiz_data.get("questions", [])
+
+    return []
+
+
+def get_quiz_question_type(default_type, question):
+    if default_type == "Multiple choice":
+        return "multiple_choice"
+
+    if default_type == "Short answer":
+        return "short_answer"
+
+    return question.get("type")
+
+
+def create_quiz_pdf(quiz_type, quiz_data):
+    questions = get_quiz_questions(quiz_data)
+    document = fitz.open()
+    page = add_pdf_page(document)
+    margin = 54
+    y = 60
+    answers = []
+
+    page.insert_text(
+        (margin, y),
+        f"{quiz_type} Quiz",
+        fontsize=20,
+        fontname="helv",
+    )
+    y += 36
+
+    for index, question in enumerate(questions, start=1):
+        question_type = get_quiz_question_type(quiz_type, question)
+
+        if y > 680:
+            page = add_pdf_page(document)
+            y = 60
+
+        y = draw_wrapped_text(
+            page,
+            f"{index}. {question.get('question', '')}",
+            margin,
+            y,
+            504,
+            font_size=12,
+        )
+        y += 6
+
+        if question_type == "multiple_choice":
+            choices = question.get("choices", [])
+
+            for choice_index, choice in enumerate(choices):
+                label = chr(ord("A") + choice_index)
+                y = draw_wrapped_text(
+                    page,
+                    f"{label}. {choice}",
+                    margin + 18,
+                    y,
+                    486,
+                )
+
+            try:
+                answer_index = int(question.get("answer_index", 0))
+            except (TypeError, ValueError):
+                answer_index = 0
+
+            if answer_index < len(choices):
+                answer_label = chr(ord("A") + answer_index)
+                answer_text = choices[answer_index]
+                answers.append(f"{index}. {answer_label}. {answer_text}")
+            else:
+                answers.append(f"{index}. ")
+
+            y += 12
+        else:
+            page.draw_rect(
+                fitz.Rect(margin, y, margin + 504, y + 70),
+                color=(0.55, 0.55, 0.55),
+                width=0.8,
+            )
+            answers.append(f"{index}. {question.get('answer', '')}")
+            y += 88
+
+    page = add_pdf_page(document)
+    y = 60
+    page.insert_text((margin, y), "Answer Key", fontsize=20, fontname="helv")
+    y += 36
+
+    for answer in answers:
+        if y > 720:
+            page = add_pdf_page(document)
+            y = 60
+
+        y = draw_wrapped_text(page, answer, margin, y, 504)
+        y += 8
+
+    pdf_bytes = document.tobytes()
+    document.close()
+    return pdf_bytes
+
+
+def draw_flashcard_side(page, rect, text):
+    page.draw_rect(rect, color=(0.35, 0.35, 0.35), width=1)
+    draw_wrapped_text(
+        page,
+        text,
+        rect.x0 + 18,
+        rect.y0 + 34,
+        rect.width - 36,
+        font_size=12,
+    )
+
+
+def draw_flashcard_pair(page, top, index, front, back):
+    page.insert_text(
+        (54, top - 14),
+        f"Card {index}",
+        fontsize=11,
+        fontname="hebo",
+        color=(0.25, 0.25, 0.25),
+    )
+    front_rect = fitz.Rect(54, top, 300, top + 260)
+    back_rect = fitz.Rect(312, top, 558, top + 260)
+    draw_flashcard_side(page, front_rect, front)
+    draw_flashcard_side(page, back_rect, back)
+
+
+def create_flashcards_pdf(flashcards_data):
+    flashcards = flashcards_data.get("flashcards", [])
+    document = fitz.open()
+    page = None
+
+    for index, flashcard in enumerate(flashcards):
+        if index % 2 == 0:
+            page = add_pdf_page(document)
+            page.insert_text((54, 42), "Flashcards", fontsize=18, fontname="helv")
+
+        top = 92 if index % 2 == 0 else 432
+        draw_flashcard_pair(
+            page,
+            top,
+            index + 1,
+            flashcard.get("front", ""),
+            flashcard.get("back", ""),
+        )
+
+    if not flashcards:
+        page = add_pdf_page(document)
+        page.insert_text((54, 60), "No flashcards generated.", fontsize=12)
+
+    pdf_bytes = document.tobytes()
+    document.close()
+    return pdf_bytes
+
 
 def get_file_type(file_name):
     return file_name.rsplit(".", 1)[-1].lower() if "." in file_name else "text"
@@ -850,6 +1254,448 @@ def save_quiz_to_supabase(user, document_id, quiz_type, content):
     ).execute()
 
     return True
+
+
+def extract_json_from_text(text):
+    clean_text = text.strip()
+
+    if clean_text.startswith("```"):
+        clean_text = clean_text.removeprefix("```json").removeprefix("```")
+        clean_text = clean_text.removesuffix("```").strip()
+
+    start_index = clean_text.find("{")
+    end_index = clean_text.rfind("}")
+
+    if start_index == -1 or end_index == -1:
+        raise ValueError("The quiz response did not contain JSON.")
+
+    return json.loads(clean_text[start_index:end_index + 1])
+
+
+def create_multiple_choice_prompt(notes_text, num_questions):
+    context = notes_text[:12000]
+
+    return f"""
+You are an AI study tutor.
+
+Create a multiple choice quiz using ONLY these notes.
+
+Number of questions: {num_questions}
+
+Return ONLY valid JSON with this exact structure:
+{{
+  "questions": [
+    {{
+      "question": "Question text",
+      "choices": ["Choice A", "Choice B", "Choice C", "Choice D"],
+      "answer_index": 0,
+      "explanation": "Short explanation of why the answer is correct."
+    }}
+  ]
+}}
+
+Rules:
+- Each question must have exactly 4 answer choices.
+- answer_index must be the zero-based index of the correct choice.
+- Do not include Markdown.
+- Do not include answers in the question text.
+
+Notes:
+{context}
+"""
+
+
+def create_short_answer_prompt(notes_text, num_questions):
+    context = notes_text[:12000]
+
+    return f"""
+You are an AI study tutor.
+
+Create a short answer quiz using ONLY these notes.
+
+Number of questions: {num_questions}
+
+Return ONLY valid JSON with this exact structure:
+{{
+  "questions": [
+    {{
+      "question": "Question text",
+      "answer": "Expected answer",
+      "explanation": "Short explanation of the answer."
+    }}
+  ]
+}}
+
+Rules:
+- Questions should require 1-3 sentence answers.
+- Do not include Markdown.
+- Do not reveal answers in the question text.
+
+Notes:
+{context}
+"""
+
+
+def create_mixed_quiz_prompt(notes_text, num_questions):
+    context = notes_text[:12000]
+
+    return f"""
+You are an AI study tutor.
+
+Create a mixed practice quiz using ONLY these notes.
+
+Number of questions: {num_questions}
+
+Return ONLY valid JSON with this exact structure:
+{{
+  "questions": [
+    {{
+      "type": "multiple_choice",
+      "question": "Question text",
+      "choices": ["Choice A", "Choice B", "Choice C", "Choice D"],
+      "answer_index": 0,
+      "explanation": "Short explanation of why the answer is correct."
+    }},
+    {{
+      "type": "short_answer",
+      "question": "Question text",
+      "answer": "Expected answer",
+      "explanation": "Short explanation of the answer."
+    }}
+  ]
+}}
+
+Rules:
+- Include a balanced mix of multiple-choice and short-answer questions.
+- Multiple-choice questions must have exactly 4 answer choices.
+- Multiple-choice answer_index must be the zero-based index of the correct
+  choice.
+- Short-answer questions should require 1-3 sentence answers.
+- Do not include Markdown.
+- Do not reveal answers in the question text.
+
+Notes:
+{context}
+"""
+
+
+def create_short_answer_grade_prompt(question, expected_answer, student_answer):
+    return f"""
+You are an AI study tutor grading a short answer question.
+
+Decide whether the student's answer is correct based on meaning, not exact
+wording.
+
+Return ONLY valid JSON with this exact structure:
+{{
+  "is_correct": true,
+  "feedback": "Brief, student-friendly feedback."
+}}
+
+Question:
+{question}
+
+Expected answer:
+{expected_answer}
+
+Student answer:
+{student_answer}
+"""
+
+
+def create_flashcards_prompt(notes_text, num_cards):
+    context = notes_text[:12000]
+
+    return f"""
+You are an AI study tutor.
+
+Create {num_cards} flashcards from the notes below.
+
+Return ONLY valid JSON with this exact structure:
+{{
+  "flashcards": [
+    {{
+      "front": "Question or term",
+      "back": "Answer or explanation"
+    }}
+  ]
+}}
+
+Rules:
+- Use ONLY the notes.
+- Keep front text short and focused.
+- Make back text clear, accurate, and useful for studying.
+- Do not include Markdown.
+
+Notes:
+{context}
+"""
+
+
+def render_multiple_choice_question(question, file_id, index, key_prefix="mc"):
+    choices = question.get("choices", [])
+    answer_index = question.get("answer_index")
+
+    if len(choices) != 4 or answer_index not in range(4):
+        st.warning("This multiple-choice question could not be displayed.")
+        return
+
+    submitted_key = f"{key_prefix}_submitted:{file_id}:{index}"
+    selected_key = f"{key_prefix}_selected:{file_id}:{index}"
+
+    st.markdown(f"**Question {index}**")
+    st.write(question.get("question", ""))
+
+    selected_choice = st.radio(
+        "Answer choices",
+        choices,
+        key=selected_key,
+        label_visibility="collapsed",
+    )
+
+    if st.button("Submit answer", key=f"{key_prefix}_submit:{file_id}:{index}"):
+        st.session_state[submitted_key] = selected_choice
+
+    submitted_choice = st.session_state.get(submitted_key)
+
+    if submitted_choice is not None:
+        correct_choice = choices[answer_index]
+
+        if submitted_choice == correct_choice:
+            st.success(f"Correct. Answer: {correct_choice}")
+        else:
+            st.error(f"Not quite. Correct answer: {correct_choice}")
+
+        explanation = question.get("explanation")
+
+        if explanation:
+            st.write(explanation)
+
+
+def render_short_answer_question(question, file_id, index, key_prefix="sa"):
+    answer_key = f"{key_prefix}_answer:{file_id}:{index}"
+    feedback_key = f"{key_prefix}_feedback:{file_id}:{index}"
+
+    st.markdown(f"**Question {index}**")
+    st.write(question.get("question", ""))
+
+    student_answer = st.text_area(
+        "Your answer",
+        key=answer_key,
+        height=100,
+    )
+
+    if st.button("Submit answer", key=f"{key_prefix}_submit:{file_id}:{index}"):
+        if not student_answer.strip():
+            st.warning("Write an answer before submitting.")
+        else:
+            prompt = create_short_answer_grade_prompt(
+                question.get("question", ""),
+                question.get("answer", ""),
+                student_answer,
+            )
+
+            with st.spinner("Checking answer..."):
+                grade_response = ask_gemini(prompt)
+
+            if grade_response:
+                try:
+                    st.session_state[feedback_key] = (
+                        extract_json_from_text(grade_response)
+                    )
+                except Exception:
+                    st.session_state[feedback_key] = {
+                        "is_correct": False,
+                        "feedback": grade_response,
+                    }
+
+    feedback = st.session_state.get(feedback_key)
+
+    if feedback:
+        if feedback.get("is_correct"):
+            st.success("Correct.")
+        else:
+            st.error("Not quite.")
+
+        if feedback.get("feedback"):
+            st.write(feedback["feedback"])
+
+        st.markdown(f"**Answer:** {question.get('answer', '')}")
+
+        explanation = question.get("explanation")
+
+        if explanation:
+            st.write(explanation)
+
+
+def render_multiple_choice_quiz(quiz_data, file_id):
+    questions = quiz_data.get("questions", [])
+
+    if not questions:
+        st.warning("The quiz did not include any questions.")
+        return
+
+    for index, question in enumerate(questions, start=1):
+        with st.container(border=True):
+            render_multiple_choice_question(question, file_id, index)
+
+
+def render_short_answer_quiz(quiz_data, file_id):
+    questions = quiz_data.get("questions", [])
+
+    if not questions:
+        st.warning("The quiz did not include any questions.")
+        return
+
+    for index, question in enumerate(questions, start=1):
+        with st.container(border=True):
+            render_short_answer_question(question, file_id, index)
+
+
+def render_mixed_quiz(quiz_data, file_id):
+    questions = quiz_data.get("questions", [])
+
+    if not questions:
+        st.warning("The quiz did not include any questions.")
+        return
+
+    for index, question in enumerate(questions, start=1):
+        question_type = question.get("type")
+
+        with st.container(border=True):
+            if question_type == "multiple_choice":
+                render_multiple_choice_question(
+                    question,
+                    file_id,
+                    index,
+                    "mix_mc",
+                )
+            elif question_type == "short_answer":
+                render_short_answer_question(
+                    question,
+                    file_id,
+                    index,
+                    "mix_sa",
+                )
+            else:
+                st.warning("This question type could not be displayed.")
+
+
+def render_flashcard_face(label, text):
+    safe_label = html.escape(label)
+    safe_text = html.escape(text)
+
+    st.markdown(
+        f"""
+<div style="
+    min-height: 230px;
+    border: 1px solid rgba(49, 51, 63, 0.2);
+    border-radius: 12px;
+    padding: 28px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    background: rgba(250, 250, 250, 0.7);
+">
+    <div style="
+        font-size: 0.8rem;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: rgba(49, 51, 63, 0.65);
+        margin-bottom: 18px;
+    ">{safe_label}</div>
+    <div style="
+        font-size: 1.45rem;
+        line-height: 1.45;
+        font-weight: 600;
+        color: rgb(49, 51, 63);
+    ">{safe_text}</div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
+
+
+def render_flashcards(flashcards_data, file_id):
+    flashcards = flashcards_data.get("flashcards", [])
+
+    if not flashcards:
+        st.warning("The flashcard response did not include any cards.")
+        return
+
+    index_key = f"flashcard_index:{file_id}"
+    flipped_key = f"flashcard_flipped:{file_id}"
+
+    if index_key not in st.session_state:
+        st.session_state[index_key] = 0
+
+    if flipped_key not in st.session_state:
+        st.session_state[flipped_key] = False
+
+    current_index = min(st.session_state[index_key], len(flashcards) - 1)
+    st.session_state[index_key] = current_index
+    flashcard = flashcards[current_index]
+    is_flipped = st.session_state[flipped_key]
+
+    left_spacer, card_column, right_spacer = st.columns([1, 2, 1])
+
+    with card_column:
+        st.caption(f"Card {current_index + 1} of {len(flashcards)}")
+
+        if is_flipped:
+            render_flashcard_face("Back", flashcard.get("back", ""))
+        else:
+            render_flashcard_face("Front", flashcard.get("front", ""))
+
+        flip_left, flip_center, flip_right = st.columns([2, 1, 2])
+
+        with flip_center:
+            if st.button("Flip card", use_container_width=True):
+                st.session_state[flipped_key] = not is_flipped
+                st.rerun()
+
+        previous_column, progress_column, next_column = st.columns([1, 2, 1])
+
+        with previous_column:
+            if st.button(
+                "← Previous",
+                disabled=current_index == 0,
+                use_container_width=True,
+            ):
+                st.session_state[index_key] = current_index - 1
+                st.session_state[flipped_key] = False
+                st.rerun()
+
+        with progress_column:
+            progress_value = (current_index + 1) / len(flashcards)
+            st.progress(progress_value)
+
+        with next_column:
+            if st.button(
+                "Next →",
+                disabled=current_index == len(flashcards) - 1,
+                use_container_width=True,
+            ):
+                st.session_state[index_key] = current_index + 1
+                st.session_state[flipped_key] = False
+                st.rerun()
+
+
+def clear_multiple_choice_state(file_id):
+    for index in range(1, 11):
+        st.session_state.pop(f"mc_submitted:{file_id}:{index}", None)
+        st.session_state.pop(f"mc_selected:{file_id}:{index}", None)
+        st.session_state.pop(f"mix_mc_submitted:{file_id}:{index}", None)
+        st.session_state.pop(f"mix_mc_selected:{file_id}:{index}", None)
+
+
+def clear_short_answer_state(file_id):
+    for index in range(1, 11):
+        st.session_state.pop(f"sa_answer:{file_id}:{index}", None)
+        st.session_state.pop(f"sa_feedback:{file_id}:{index}", None)
+        st.session_state.pop(f"mix_sa_answer:{file_id}:{index}", None)
+        st.session_state.pop(f"mix_sa_feedback:{file_id}:{index}", None)
 
 
 def save_flashcards_to_supabase(user, document_id, content):
@@ -1029,10 +1875,22 @@ with tab2:
         value=5,
     )
 
-    if st.button("Generate Quiz"):
-        context = notes_text[:12000]
+    quiz_state_key = f"quiz:{file_id}"
 
-        prompt = f"""
+    if st.button("Generate Quiz"):
+        clear_multiple_choice_state(file_id)
+        clear_short_answer_state(file_id)
+
+        if quiz_type == "Multiple choice":
+            prompt = create_multiple_choice_prompt(notes_text, num_questions)
+        elif quiz_type == "Short answer":
+            prompt = create_short_answer_prompt(notes_text, num_questions)
+        elif quiz_type == "Mixed":
+            prompt = create_mixed_quiz_prompt(notes_text, num_questions)
+        else:
+            context = notes_text[:12000]
+
+            prompt = f"""
 You are an AI study tutor.
 
 Create a {quiz_type.lower()} quiz using ONLY these notes.
@@ -1052,7 +1910,29 @@ Notes:
             quiz = ask_gemini(prompt)
 
         if quiz:
-            st.markdown(quiz)
+            if quiz_type in {"Multiple choice", "Short answer", "Mixed"}:
+                try:
+                    quiz_data = extract_json_from_text(quiz)
+                    st.session_state[quiz_state_key] = {
+                        "type": quiz_type,
+                        "content": quiz_data,
+                    }
+                    quiz_to_save = json.dumps(quiz_data)
+                except Exception as error:
+                    st.error("The quiz could not be formatted.")
+                    st.write(error)
+                    st.markdown(quiz)
+                    st.session_state[quiz_state_key] = {
+                        "type": "Markdown",
+                        "content": quiz,
+                    }
+                    quiz_to_save = quiz
+            else:
+                st.session_state[quiz_state_key] = {
+                    "type": quiz_type,
+                    "content": quiz,
+                }
+                quiz_to_save = quiz
 
             document_id = get_current_saved_document_id(file_id)
 
@@ -1062,14 +1942,36 @@ Notes:
                         current_user,
                         document_id,
                         quiz_type,
-                        quiz,
+                        quiz_to_save,
                     )
-                    st.success("Quiz saved.")
                 except Exception as error:
                     st.warning("The quiz was generated, but could not be saved.")
                     st.write(error)
             elif current_user:
                 st.caption("Save this document first to save generated quizzes.")
+
+    active_quiz = st.session_state.get(quiz_state_key)
+
+    if active_quiz:
+        if active_quiz["type"] == "Multiple choice":
+            render_multiple_choice_quiz(active_quiz["content"], file_id)
+            quiz_pdf = create_quiz_pdf(active_quiz["type"], active_quiz["content"])
+        elif active_quiz["type"] == "Short answer":
+            render_short_answer_quiz(active_quiz["content"], file_id)
+            quiz_pdf = create_quiz_pdf(active_quiz["type"], active_quiz["content"])
+        elif active_quiz["type"] == "Mixed":
+            render_mixed_quiz(active_quiz["content"], file_id)
+            quiz_pdf = create_quiz_pdf(active_quiz["type"], active_quiz["content"])
+        else:
+            st.markdown(active_quiz["content"])
+            quiz_pdf = create_text_pdf("Quiz", active_quiz["content"])
+
+        st.download_button(
+            "Download quiz PDF",
+            data=quiz_pdf,
+            file_name="quiz.pdf",
+            mime="application/pdf",
+        )
 
 
 with tab3:
@@ -1082,30 +1984,32 @@ with tab3:
         value=10,
     )
 
+    flashcards_state_key = f"flashcards:{file_id}"
+
     if st.button("Generate Flashcards"):
-        context = notes_text[:12000]
-
-        prompt = f"""
-You are an AI study tutor.
-
-Create {num_cards} flashcards from the notes below.
-
-Format each flashcard like this:
-
-Front: question or term
-Back: answer or explanation
-
-Use ONLY the notes.
-
-Notes:
-{context}
-"""
+        st.session_state.pop(f"flashcard_index:{file_id}", None)
+        st.session_state.pop(f"flashcard_flipped:{file_id}", None)
+        prompt = create_flashcards_prompt(notes_text, num_cards)
 
         with st.spinner("Creating flashcards..."):
             flashcards = ask_gemini(prompt)
 
         if flashcards:
-            st.markdown(flashcards)
+            try:
+                flashcards_data = extract_json_from_text(flashcards)
+                st.session_state[flashcards_state_key] = {
+                    "type": "cards",
+                    "content": flashcards_data,
+                }
+                flashcards_to_save = json.dumps(flashcards_data)
+            except Exception as error:
+                st.error("The flashcards could not be formatted.")
+                st.write(error)
+                st.session_state[flashcards_state_key] = {
+                    "type": "Markdown",
+                    "content": flashcards,
+                }
+                flashcards_to_save = flashcards
 
             document_id = get_current_saved_document_id(file_id)
 
@@ -1114,9 +2018,8 @@ Notes:
                     save_flashcards_to_supabase(
                         current_user,
                         document_id,
-                        flashcards,
+                        flashcards_to_save,
                     )
-                    st.success("Flashcards saved.")
                 except Exception as error:
                     st.warning(
                         "The flashcards were generated, but could not be saved."
@@ -1126,3 +2029,23 @@ Notes:
                 st.caption(
                     "Save this document first to save generated flashcards."
                 )
+
+    active_flashcards = st.session_state.get(flashcards_state_key)
+
+    if active_flashcards:
+        if active_flashcards["type"] == "cards":
+            render_flashcards(active_flashcards["content"], file_id)
+            flashcards_pdf = create_flashcards_pdf(active_flashcards["content"])
+        else:
+            st.markdown(active_flashcards["content"])
+            flashcards_pdf = create_text_pdf(
+                "Flashcards",
+                active_flashcards["content"],
+            )
+
+        st.download_button(
+            "Download flashcards PDF",
+            data=flashcards_pdf,
+            file_name="flashcards.pdf",
+            mime="application/pdf",
+        )
