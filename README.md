@@ -13,8 +13,12 @@ The web app is hosted at [`https://ai-studying-tool.streamlit.app/`](https://ai-
 ## Tech Stack
 
 - Python
-- Streamlit - the web interface
+- Streamlit - web interface
 - Gemini API - generation, grading, and embeddings
+- RAG - retrieval-augmented generation over uploaded notes
+- pgvector - semantic search over embedded document chunks
+- Supabase - authentication and backend platform
+- PostgreSQL - persistent storage for documents, quizzes, flashcards, and study notes
+- Supabase Row Level Security - user-scoped saved materials
 - PyMuPDF - PDF text extraction and PDF export
-- RAG (retrieval-augmented generation)
-- Supabase - authentication, Postgres storage, saved study materials, and pgvector
+- GitHub Actions - scheduled keep-alive workflow
