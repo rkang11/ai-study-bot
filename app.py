@@ -15,8 +15,8 @@ st.set_page_config(
 
 st.title("📚 AI Study Buddy")
 st.write(
-    "Upload your class notes or a PDF, then ask questions, generate quizzes, "
-    "and create flashcards."
+    "Upload notes or choose a saved document, then ask questions, generate "
+    "quizzes, and create flashcards."
 )
 
 
@@ -178,6 +178,41 @@ def list_saved_documents(user):
     return getattr(response, "data", None) or []
 
 
+def rename_saved_document(user, document_id, new_file_name):
+    supabase = get_supabase_client()
+    user_id = get_user_id(user)
+
+    if supabase is None or not user_id:
+        return
+
+    supabase.table("documents").update(
+        {
+            "file_name": new_file_name,
+        }
+    ).eq("id", document_id).eq("user_id", user_id).execute()
+
+
+def delete_saved_document(user, document_id):
+    supabase = get_supabase_client()
+    user_id = get_user_id(user)
+
+    if supabase is None or not user_id:
+        return
+
+    supabase.table("documents").delete().eq(
+        "id",
+        document_id,
+    ).eq("user_id", user_id).execute()
+
+
+def clear_active_saved_document(document_id):
+    if st.session_state.get("saved_document_id") != document_id:
+        return
+
+    st.session_state.pop("saved_file_id", None)
+    st.session_state.pop("saved_document_id", None)
+
+
 def show_saved_documents_sidebar(user):
     if user is None or get_supabase_client() is None:
         return None
@@ -217,7 +252,57 @@ def show_saved_documents_sidebar(user):
             list(document_options.keys()),
         )
 
-        return document_options[selected_label]
+        selected_document_id = document_options[selected_label]
+
+        if selected_document_id is None:
+            return None
+
+        selected_document = next(
+            document
+            for document in documents
+            if document["id"] == selected_document_id
+        )
+
+        with st.expander("Manage selected note"):
+            new_file_name = st.text_input(
+                "Name",
+                value=selected_document["file_name"],
+            )
+
+            if st.button("Rename note"):
+                cleaned_file_name = new_file_name.strip()
+
+                if not cleaned_file_name:
+                    st.warning("Enter a name first.")
+                else:
+                    try:
+                        rename_saved_document(
+                            user,
+                            selected_document_id,
+                            cleaned_file_name,
+                        )
+                        clear_active_saved_document(selected_document_id)
+                        st.success("Saved note renamed.")
+                        st.rerun()
+                    except Exception as error:
+                        st.error("Could not rename this note.")
+                        st.write(error)
+
+            confirm_delete = st.checkbox(
+                "I understand this will delete the saved note."
+            )
+
+            if st.button("Delete note", disabled=not confirm_delete):
+                try:
+                    delete_saved_document(user, selected_document_id)
+                    clear_active_saved_document(selected_document_id)
+                    st.success("Saved note deleted.")
+                    st.rerun()
+                except Exception as error:
+                    st.error("Could not delete this note.")
+                    st.write(error)
+
+        return selected_document_id
 
 
 def parse_pgvector_embedding(value):
