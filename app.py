@@ -367,7 +367,7 @@ def load_saved_document(document_id):
     supabase = get_supabase_client()
 
     document_response = supabase.table("documents").select(
-        "id, file_name, char_count"
+        "id, file_name, char_count, study_notes"
     ).eq("id", document_id).single().execute()
     document = getattr(document_response, "data", None)
 
@@ -400,6 +400,7 @@ def load_saved_document(document_id):
         "file_name": document["file_name"],
         "file_id": f"saved:{document['id']}",
         "notes_text": notes_text,
+        "study_notes": document.get("study_notes"),
         "indexed_chunks": indexed_chunks,
     }
 
@@ -601,6 +602,127 @@ def show_relevant_note_sections(chunks):
             st.write(make_snippet(chunk["text"]))
 
 
+def generate_study_notes(notes_text):
+    context = notes_text[:12000]
+
+    prompt = f"""
+You are an AI study tutor.
+
+Create organized study notes from the uploaded material below.
+
+Use ONLY the material below.
+
+Format the study notes in Markdown with clear headings:
+
+## Overview
+Briefly explain what the notes are about.
+
+## Key Concepts
+List the most important concepts with concise explanations. Bold key terms.
+
+## Important Details
+Organize supporting facts, examples, formulas, dates, names, or processes.
+
+## Common Confusions
+Point out ideas students might mix up and clarify the differences.
+
+## Quick Review Questions
+Write 5 short questions a student can use to check understanding.
+
+Keep the notes easy to scan with short paragraphs and bullet points.
+
+Material:
+{context}
+"""
+
+    return ask_gemini(prompt)
+
+
+def save_study_notes_to_supabase(user, document_id, study_notes):
+    supabase = get_supabase_client()
+    user_id = get_user_id(user)
+
+    if supabase is None or not user_id or not document_id or not study_notes:
+        return False
+
+    supabase.table("documents").update(
+        {
+            "study_notes": study_notes,
+        }
+    ).eq("id", document_id).eq("user_id", user_id).execute()
+
+    return True
+
+
+def extract_markdown_section(markdown_text, heading):
+    section_lines = []
+    in_section = False
+    target_heading = f"## {heading}".lower()
+
+    for line in markdown_text.splitlines():
+        clean_line = line.strip()
+
+        if clean_line.lower() == target_heading:
+            in_section = True
+            continue
+
+        if in_section and clean_line.startswith("## "):
+            break
+
+        if in_section:
+            section_lines.append(line)
+
+    return "\n".join(section_lines).strip()
+
+
+def show_study_notes(
+    notes_text,
+    file_id,
+    current_user=None,
+    document_id=None,
+    saved_study_notes=None,
+):
+    cache_key = f"study_notes:{file_id}"
+    saved_key = f"study_notes_saved:{file_id}"
+
+    st.subheader("Study Notes")
+
+    if saved_study_notes and cache_key not in st.session_state:
+        st.session_state[cache_key] = saved_study_notes
+        st.session_state[saved_key] = True
+
+    if cache_key not in st.session_state:
+        with st.spinner("Creating study notes..."):
+            st.session_state[cache_key] = generate_study_notes(notes_text)
+
+    study_notes = st.session_state.get(cache_key)
+
+    if not study_notes:
+        st.info("Study notes could not be generated yet.")
+        return
+
+    if document_id and not st.session_state.get(saved_key):
+        try:
+            if save_study_notes_to_supabase(
+                current_user,
+                document_id,
+                study_notes,
+            ):
+                st.session_state[saved_key] = True
+        except Exception as error:
+            st.warning("Study notes were generated but could not be saved.")
+            st.caption(str(error))
+
+    overview = extract_markdown_section(study_notes, "Overview")
+
+    with st.container(border=True):
+        st.markdown("**Overview**")
+        st.markdown(overview or make_snippet(study_notes, 700))
+
+    with st.expander("View full study notes"):
+        st.markdown(study_notes)
+
+
 def get_file_type(file_name):
     return file_name.rsplit(".", 1)[-1].lower() if "." in file_name else "text"
 
@@ -615,6 +737,7 @@ def save_document_to_supabase(
     uploaded_file,
     notes_text,
     indexed_chunks,
+    study_notes=None,
 ):
     user_id = get_user_id(user)
 
@@ -628,6 +751,7 @@ def save_document_to_supabase(
             "file_name": uploaded_file.name,
             "file_type": get_file_type(uploaded_file.name),
             "char_count": len(notes_text),
+            "study_notes": study_notes,
         }
     ).execute()
 
@@ -679,17 +803,21 @@ def show_save_document_controls(
 
         try:
             with st.spinner("Saving document..."):
+                study_notes = st.session_state.get(f"study_notes:{file_id}")
                 document_id = save_document_to_supabase(
                     supabase,
                     current_user,
                     uploaded_file,
                     notes_text,
                     indexed_chunks,
+                    study_notes,
                 )
 
             st.session_state.saved_file_id = file_id
             st.session_state.saved_document_id = document_id
             st.session_state.selected_saved_document_id = document_id
+            if study_notes:
+                st.session_state[f"study_notes_saved:saved:{document_id}"] = True
             st.success("Document saved.")
             st.rerun()
 
@@ -763,6 +891,7 @@ def ask_gemini(prompt):
 
 current_user = show_account_sidebar()
 selected_saved_document_id = show_saved_documents_sidebar(current_user)
+saved_study_notes = None
 
 uploaded_file = st.file_uploader(
     "Upload a PDF, text file, or Markdown file",
@@ -780,6 +909,7 @@ if selected_saved_document_id:
     notes_text = saved_document["notes_text"]
     indexed_chunks = saved_document["indexed_chunks"]
     file_id = saved_document["file_id"]
+    saved_study_notes = saved_document["study_notes"]
     st.session_state.saved_file_id = file_id
     st.session_state.saved_document_id = saved_document["document_id"]
     st.success(f"Loaded saved document: {saved_document['file_name']}")
@@ -829,11 +959,13 @@ else:
 if not indexed_chunks:
     st.stop()
 
-with st.expander("Preview extracted notes"):
-    st.write(notes_text[:5000])
-
-    if len(notes_text) > 5000:
-        st.write("...preview shortened...")
+show_study_notes(
+    notes_text,
+    file_id,
+    current_user,
+    get_current_saved_document_id(file_id),
+    saved_study_notes,
+)
 
 
 tab1, tab2, tab3 = st.tabs(

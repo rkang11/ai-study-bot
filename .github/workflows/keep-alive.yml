@@ -1,0 +1,17 @@
+name: Keep Streamlit App Awake
+
+on:
+  schedule:
+    - cron: "0 */6 * * *" 
+  
+  workflow_dispatch: 
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Streamlit App
+        run: curl -sSf https://ai-studying-tool.streamlit.app/ > /dev/null
+        
+      - name: Log status
+        run: echo "Pinged the app successfully!"

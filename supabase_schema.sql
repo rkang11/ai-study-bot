@@ -6,8 +6,12 @@ create table if not exists public.documents (
     file_name text not null,
     file_type text not null,
     char_count integer not null default 0,
+    study_notes text,
     created_at timestamp with time zone not null default now()
 );
+
+alter table public.documents
+add column if not exists study_notes text;
 
 create table if not exists public.document_chunks (
     id uuid primary key default gen_random_uuid(),
