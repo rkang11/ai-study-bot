@@ -88,6 +88,20 @@ def get_user_email(user):
     return user.get("email")
 
 
+def remember_supabase_user(auth_response):
+    user = getattr(auth_response, "user", None)
+
+    if user is not None:
+        st.session_state.supabase_user = user
+
+
+def clear_supabase_session_state():
+    st.session_state.pop("supabase_user", None)
+    st.session_state.pop("saved_file_id", None)
+    st.session_state.pop("saved_document_id", None)
+    st.session_state.pop("selected_saved_document_id", None)
+
+
 def show_account_sidebar():
     with st.sidebar:
         st.header("Account")
@@ -102,30 +116,45 @@ def show_account_sidebar():
         current_user = st.session_state.get("supabase_user")
 
         if current_user:
-            st.success(f"Signed in as {get_user_email(current_user)}")
+            st.caption("Signed in")
+            st.write(get_user_email(current_user))
 
-            if st.button("Sign out"):
+            if st.button("Sign out", use_container_width=True):
                 try:
                     supabase.auth.sign_out()
                 except Exception:
                     pass
 
-                st.session_state.pop("supabase_user", None)
-                st.session_state.pop("saved_file_id", None)
-                st.session_state.pop("saved_document_id", None)
+                clear_supabase_session_state()
                 st.rerun()
 
             return current_user
 
+        auth_action = st.radio(
+            "Account action",
+            ["Sign in", "Create account"],
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+
         with st.form("account_form"):
-            email = st.text_input("Email")
-            password = st.text_input("Password", type="password")
-            auth_action = st.radio(
-                "Action",
-                ["Sign in", "Create account"],
-                horizontal=True,
+            email = st.text_input(
+                "Email",
+                placeholder="you@example.com",
             )
-            submitted = st.form_submit_button(auth_action)
+            password = st.text_input(
+                "Password",
+                type="password",
+                placeholder="Your password",
+            )
+            submitted = st.form_submit_button(
+                auth_action,
+                use_container_width=True,
+                type="primary",
+            )
+
+        if auth_action == "Create account":
+            st.caption("New accounts may require email confirmation.")
 
         if submitted:
             if not email.strip() or not password:
@@ -149,14 +178,14 @@ def show_account_sidebar():
                     )
 
                 if response.user:
-                    st.session_state.supabase_user = response.user
+                    remember_supabase_user(response)
                     st.rerun()
 
                 st.info("Check your email to finish creating your account.")
 
             except Exception as error:
                 st.error("Account request failed.")
-                st.write(error)
+                st.caption(str(error))
 
         return None
 
@@ -211,6 +240,7 @@ def clear_active_saved_document(document_id):
 
     st.session_state.pop("saved_file_id", None)
     st.session_state.pop("saved_document_id", None)
+    st.session_state.pop("selected_saved_document_id", None)
 
 
 def show_saved_documents_sidebar(user):
@@ -247,12 +277,25 @@ def show_saved_documents_sidebar(user):
             label = f"{document['file_name']} · {saved_date}"
             document_options[label] = document["id"]
 
+        selected_saved_document_id = st.session_state.get(
+            "selected_saved_document_id"
+        )
+        default_index = 0
+
+        if selected_saved_document_id:
+            for index, document_id in enumerate(document_options.values()):
+                if document_id == selected_saved_document_id:
+                    default_index = index
+                    break
+
         selected_label = st.selectbox(
             "Study from",
             list(document_options.keys()),
+            index=default_index,
         )
 
         selected_document_id = document_options[selected_label]
+        st.session_state.selected_saved_document_id = selected_document_id
 
         if selected_document_id is None:
             return None
@@ -646,7 +689,9 @@ def show_save_document_controls(
 
             st.session_state.saved_file_id = file_id
             st.session_state.saved_document_id = document_id
+            st.session_state.selected_saved_document_id = document_id
             st.success("Document saved.")
+            st.rerun()
 
         except Exception as error:
             st.error("Could not save this document.")
